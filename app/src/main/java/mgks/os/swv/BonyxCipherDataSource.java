@@ -1,4 +1,4 @@
-package com.bonyx.player;
+package com.bonyx.player; // Make sure this package name matches your project structure!
 
 import android.net.Uri;
 
@@ -20,8 +20,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
-import java.util.Collections;
-import java.util.Map;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
@@ -29,31 +27,6 @@ import javax.crypto.spec.SecretKeySpec;
 
 /**
  * BONYX CipherDataSource — AES-256-GCM
- * ======================================
- * AndroidX Media3 DataSource that:
- *   1. Opens the downstream DataSource (FileDataSource or HttpDataSource).
- *   2. Reads the .bonyx v2 header: magic (6) + nonce-length (4) + nonce (12).
- *   3. Fetches the AES-256-GCM key + base nonce from the Cloudflare Worker.
- *   4. Decrypts each chunk in memory using AES/GCM/NoPadding, verifying the
- *      16-byte auth tag on every chunk — any tampering throws an exception.
- *   5. Buffers decrypted plaintext and serves it to ExoPlayer on demand.
- *
- * .bonyx v2 chunk layout (matches the Python encoder):
- *   [4 bytes big-endian] ciphertext+tag length
- *   [C bytes]            GCM ciphertext followed by 16-byte auth tag
- *
- * Per-chunk nonce: base_nonce XOR (chunk_index as big-endian uint32 in last 4 bytes)
- *
- * Usage:
- *   DataSource.Factory factory = () -> new BonyxCipherDataSource(
- *       new FileDataSource(),
- *       "https://key.example.workers.dev",
- *       telegramUserId,
- *       videoId
- *   );
- *   MediaItem item = MediaItem.fromUri(Uri.fromFile(bonyxFile));
- *   player.setMediaSource(
- *       new ProgressiveMediaSource.Factory(factory).createMediaSource(item));
  */
 public class BonyxCipherDataSource implements DataSource {
 
@@ -76,11 +49,9 @@ public class BonyxCipherDataSource implements DataSource {
     private Uri              openedUri;
     private InputStream      rawStream;
 
-    // AES key + base nonce fetched once per open()
     private byte[]           aesKey;
     private byte[]           baseNonce;
 
-    // Decrypted plaintext buffer
     private byte[]           plaintextBuffer  = new byte[0];
     private int              bufferReadPos    = 0;
     private int              bufferLimit      = 0;
@@ -98,9 +69,11 @@ public class BonyxCipherDataSource implements DataSource {
         this.videoId        = videoId;
     }
 
-    // ─────────────────────────────────────────
-    //  open()
-    // ─────────────────────────────────────────
+    @Override
+    public void addTransferListener(@NonNull TransferListener transferListener) {
+        downstream.addTransferListener(transferListener);
+    }
+
     @Override
     public long open(@NonNull DataSpec dataSpec) throws IOException {
         openedUri   = dataSpec.uri;
@@ -108,47 +81,35 @@ public class BonyxCipherDataSource implements DataSource {
         endOfStream = false;
         bufferReadPos = bufferLimit = 0;
 
-        // 1. Open downstream source
         downstream.open(dataSpec);
         rawStream = new DataSourceInputStream(downstream);
 
-        // 2. Validate .bonyx magic header
         byte[] magic = readExactly(rawStream, BONYX_MAGIC.length);
         for (int i = 0; i < BONYX_MAGIC.length; i++) {
             if (magic[i] != BONYX_MAGIC[i]) {
-                throw new IOException(
-                    "Not a valid .bonyx v2 file (bad magic). " +
-                    "Ensure the file was created with AES-256-GCM encoder.");
+                throw new IOException("Not a valid .bonyx v2 file (bad magic).");
             }
         }
 
-        // 3. Read nonce length field (must be 12)
         byte[] nonceLenBytes = readExactly(rawStream, NONCE_LEN_FIELD);
         int nonceLen = ByteBuffer.wrap(nonceLenBytes).order(ByteOrder.BIG_ENDIAN).getInt();
         if (nonceLen != EXPECTED_NONCE) {
             throw new IOException("Unexpected nonce length in header: " + nonceLen);
         }
 
-        // 4. Read base nonce
         baseNonce = readExactly(rawStream, nonceLen);
 
-        // 5. Fetch AES-256-GCM key from Cloudflare Worker
-        //    (call this on a background thread in your ExoPlayer setup)
         KeyPayload kp = fetchKeyFromWorker(telegramUserId, videoId);
         aesKey    = kp.key;
-        baseNonce = kp.nonce;   // Worker is authoritative; overwrite file nonce
+        baseNonce = kp.nonce;   
 
-        return C.LENGTH_UNSET;  // length unknown after decryption
+        return C.LENGTH_UNSET;  
     }
 
-    // ─────────────────────────────────────────
-    //  read()  — serves decrypted bytes to ExoPlayer
-    // ─────────────────────────────────────────
     @Override
     public int read(@NonNull byte[] output, int offset, int length) throws IOException {
         if (length == 0) return 0;
 
-        // Refill buffer when empty
         while (bufferReadPos >= bufferLimit) {
             if (endOfStream) return C.RESULT_END_OF_INPUT;
             if (!decryptNextChunk()) {
@@ -164,9 +125,6 @@ public class BonyxCipherDataSource implements DataSource {
         return toCopy;
     }
 
-    // ─────────────────────────────────────────
-    //  close()
-    // ─────────────────────────────────────────
     @Override
     public void close() throws IOException {
         try {
@@ -176,29 +134,20 @@ public class BonyxCipherDataSource implements DataSource {
             }
         } finally {
             downstream.close();
-            // Wipe key material from memory
             if (aesKey   != null) java.util.Arrays.fill(aesKey,    (byte) 0);
             if (baseNonce != null) java.util.Arrays.fill(baseNonce, (byte) 0);
         }
     }
 
     @Nullable @Override public Uri getUri() { return openedUri; }
-    }
+    // THE ROGUE BRACKET WAS HERE. IT HAS BEEN DELETED.
 
-    // ─────────────────────────────────────────
-    //  CHUNK DECRYPTION (AES-256-GCM)
-    // ─────────────────────────────────────────
-    /**
-     * Reads and decrypts the next chunk from rawStream.
-     * Returns false when the stream is exhausted.
-     */
     private boolean decryptNextChunk() throws IOException {
-        // Read 4-byte chunk length prefix
         byte[] lenBytes = new byte[4];
         int got = 0;
         while (got < 4) {
             int r = rawStream.read(lenBytes, got, 4 - got);
-            if (r == -1) return false;   // clean EOF between chunks
+            if (r == -1) return false;   
             got += r;
         }
 
@@ -207,10 +156,7 @@ public class BonyxCipherDataSource implements DataSource {
             throw new IOException("Corrupt .bonyx chunk length: " + chunkLen);
         }
 
-        // Read full ciphertext + GCM tag
         byte[] ciphertextAndTag = readExactly(rawStream, chunkLen);
-
-        // Derive per-chunk nonce: XOR last 4 bytes of base nonce with chunk index
         byte[] chunkNonce = baseNonce.clone();
         ByteBuffer idxBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
         idxBuf.putInt(chunkIndex);
@@ -219,7 +165,6 @@ public class BonyxCipherDataSource implements DataSource {
             chunkNonce[EXPECTED_NONCE - 4 + i] ^= idxBytes[i];
         }
 
-        // Decrypt and authenticate
         try {
             Cipher cipher = Cipher.getInstance(TRANSFORMATION);
             cipher.init(
@@ -232,18 +177,11 @@ public class BonyxCipherDataSource implements DataSource {
             bufferLimit     = plaintextBuffer.length;
             chunkIndex++;
             return true;
-
         } catch (GeneralSecurityException e) {
-            // GCM tag mismatch — file has been tampered or key is wrong
-            throw new IOException(
-                "AES-GCM authentication failed on chunk " + chunkIndex +
-                ". File may be corrupt or tampered.", e);
+            throw new IOException("AES-GCM authentication failed on chunk " + chunkIndex, e);
         }
     }
 
-    // ─────────────────────────────────────────
-    //  KEY FETCH — POST /key to Cloudflare Worker
-    // ─────────────────────────────────────────
     private KeyPayload fetchKeyFromWorker(String tgId, String vidId) throws IOException {
         String endpoint = workerUrl.replaceAll("/$", "") + "/key";
         HttpURLConnection conn = (HttpURLConnection) new URL(endpoint).openConnection();
@@ -265,15 +203,13 @@ public class BonyxCipherDataSource implements DataSource {
             byte[] respBytes = conn.getInputStream().readAllBytes();
             JSONObject obj   = new JSONObject(new String(respBytes, StandardCharsets.UTF_8));
 
-            // Validate expiry
             long expiresAt = obj.optLong("expires_at", Long.MAX_VALUE);
             if (System.currentTimeMillis() / 1000 > expiresAt) {
                 throw new IOException("Key payload has expired — reopen the video to retry.");
             }
 
-            // Parse AES-256-GCM key (32 bytes) and nonce (12 bytes)
             byte[] key   = hexToBytes(obj.getString("key"));
-            byte[] nonce = hexToBytes(obj.getString("nonce"));  // GCM nonce field
+            byte[] nonce = hexToBytes(obj.getString("nonce"));  
 
             if (key.length != 32) throw new IOException("Invalid key length from server.");
             if (nonce.length != 12) throw new IOException("Invalid nonce length from server.");
@@ -287,9 +223,6 @@ public class BonyxCipherDataSource implements DataSource {
         }
     }
 
-    // ─────────────────────────────────────────
-    //  UTILITIES
-    // ─────────────────────────────────────────
     private static byte[] readExactly(InputStream in, int length) throws IOException {
         byte[] buf    = new byte[length];
         int    offset = 0;
@@ -313,21 +246,12 @@ public class BonyxCipherDataSource implements DataSource {
         return data;
     }
 
-    // ─────────────────────────────────────────
-    //  INNER TYPES
-    // ─────────────────────────────────────────
-
-    /** Simple value object returned by fetchKeyFromWorker() */
     private static final class KeyPayload {
         final byte[] key;
         final byte[] nonce;
         KeyPayload(byte[] key, byte[] nonce) { this.key = key; this.nonce = nonce; }
     }
 
-    /**
-     * Bridges the Media3 DataSource.read() contract to a standard InputStream
-     * so we can feed bytes into JCE's Cipher.doFinal().
-     */
     private static final class DataSourceInputStream extends InputStream {
         private final DataSource source;
         private final byte[]     one = new byte[1];
