@@ -102,4 +102,11 @@ if (file('google-services.json').exists()) {
     apply plugin: 'com.google.gms.google-services'
 } else {
     println "swv-fcm-sync: google-services.json not found. Skipping Firebase Configuration."
+    // ADDED BY US: ExoPlayer for Hardware Accelerated Video
+    implementation 'androidx.media3:media3-exoplayer:1.2.0'
+    implementation 'androidx.media3:media3-ui:1.2.0'
+    
+    // ADDED BY US: Firebase for Cloud Messaging (FCM)
+    implementation platform('com.google.firebase:firebase-bom:32.7.0')
+    implementation 'com.google.firebase:firebase-messaging'
 }
