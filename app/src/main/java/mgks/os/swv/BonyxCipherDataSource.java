@@ -183,9 +183,6 @@ public class BonyxCipherDataSource implements DataSource {
     }
 
     @Nullable @Override public Uri getUri() { return openedUri; }
-    @Override public Map<String, List<String>> getResponseHeaders() { return Collections.emptyMap(); }
-    @Override public void addTransferListener(@NonNull TransferListener l) {
-        downstream.addTransferListener(l);
     }
 
     // ─────────────────────────────────────────
